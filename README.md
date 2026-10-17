@@ -18,6 +18,15 @@
 - **Recent activity timeline** – last worker spawn, last STT start, last finished transcript
 - **100% local** – no cloud calls, no accounts, no quota; reads your own host's procfs and daemon log only
 
+## 🚦 Status types
+
+| Dot | State          | Meaning                                            |
+| :-: | :------------- | :------------------------------------------------- |
+| 🟢  | `warm`         | Worker loaded in RAM — next voice input is instant |
+| 🟠  | `cooling`      | Used moments ago; Paseo releases the model shortly |
+| 🟣  | `transcribing` | Parakeet is decoding audio right now               |
+| ⚪  | `cold`         | No worker running — first use pays the ~10 s load  |
+
 ## 💻 Installation
 
 > You can add **paseo-stt-worker-status** to Paseo with one command:
@@ -27,6 +36,7 @@
 ```bash
 paseo plugin install github:ArnavK-09/paseo-stt-worker-status
 ```
+
 > [!IMPORTANT]
 > Requires [Paseo](https://paseo.sh) desktop `0.11.4+` on **Linux or macOS** (Paseo's platforms). Live worker probing is kernel-accurate on Linux (`/proc`) and uses `pgrep`/`ps` on macOS.
 
@@ -44,12 +54,12 @@ paseo plugin add ./
 
 > Here are the screenshots of **paseo-stt-worker-status** in action
 
-| Sidebar footer status |
-|:------------------------:|
+|                                       Sidebar footer status                                       |
+| :-----------------------------------------------------------------------------------------------: |
 | ![Footer status](https://github.com/user-attachments/assets/dd252772-a505-41d4-bdf7-9b2730793400) |
 
-| Full detail screen |
-|:---------------------:|
+|                                        Full detail screen                                         |
+| :-----------------------------------------------------------------------------------------------: |
 | ![Detail screen](https://github.com/user-attachments/assets/6bd383e0-829d-4f9e-b3ef-ea3024220f9b) |
 
 ---
@@ -108,7 +118,6 @@ Found a bug or need help? Please create an issue on the [GitHub repository](http
 </table>
 
 ---
-
 
 <p align="center">
     <strong>🌟 If you find this project helpful, please give it a star on GitHub! 🌟</strong>
