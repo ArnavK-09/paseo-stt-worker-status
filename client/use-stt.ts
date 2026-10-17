@@ -17,7 +17,7 @@ export function useSttPoll(fast: boolean) {
 }
 
 export type EngineState = {
-  key: "warm" | "cooling" | "cold" | "busy" | "unknown" | "error";
+  key: "warm" | "cold" | "busy" | "unknown" | "error";
   label: string;
   detail: string;
 };
@@ -56,14 +56,6 @@ export function engineState(
       key: "warm",
       label: "warm",
       detail: "Speech worker (Paseo Voice) is running — your voice reaches the model instantly.",
-    };
-  }
-  const justUsed = data.lastFinalSecAgo !== null && data.lastFinalSecAgo < 60;
-  if (justUsed) {
-    return {
-      key: "cooling",
-      label: "cooling",
-      detail: `A transcript finished ${data.lastFinalSecAgo}s ago; Paseo releases the model shortly after each burst.`,
     };
   }
   const slowLoad = data.lastSttProcessingMs !== null && data.lastSttProcessingMs > 3000;

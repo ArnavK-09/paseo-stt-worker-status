@@ -6,11 +6,11 @@
 
 > [!NOTE]
 >
-> **paseo-stt-worker-status** is a Paseo plugin that shows the live state of Paseo's local speech worker ("Paseo Voice") right in your sidebar footer. If you have ever wondered why that first voice input after opening Paseo took ten seconds, this is the plugin that answers it — the worker loads ~630 MB of Parakeet weights into RAM, and the dot tells you exactly when that load is warm, cooling, or still cold. The same worker backs both dictation and voice mode, so the status covers both.
+> **paseo-stt-worker-status** is a Paseo plugin that shows the live state of Paseo's local speech worker ("Paseo Voice") right in your sidebar footer. If you have ever wondered why that first voice input after opening Paseo took ten seconds, this is the plugin that answers it — the worker loads ~630 MB of Parakeet weights into RAM, and the dot tells you exactly when that load is warm or still cold. The same worker backs both dictation and voice mode, so the status covers both.
 
 ## 🌟 Features
 
-- **Live status dot** – green **warm**, amber **cooling**, gray **cold**, purple **transcribing** — straight in the sidebar footer
+- **Live status dot** – green **warm**, gray **cold**, purple **transcribing** — straight in the sidebar footer
 - **Covers every voice surface** – the STT worker serves dictation _and_ voice mode; one letter for both
 - **Real process probing** – warm/cold state comes from the actual `Paseo Voice` process (procfs on Linux, `pgrep`/`ps` on macOS), never guessed
 - **Transcribe detection** – the worker's accumulated CPU time exposes live Parakeet decoding activity
@@ -23,7 +23,6 @@
 | Dot | State          | Meaning                                            |
 | :-: | :------------- | :------------------------------------------------- |
 | 🟢  | `warm`         | Worker loaded in RAM — next voice input is instant |
-| 🟠  | `cooling`      | Used moments ago; Paseo releases the model shortly |
 | 🟣  | `transcribing` | Parakeet is decoding audio right now               |
 | ⚪  | `cold`         | No worker running — first use pays the ~10 s load  |
 

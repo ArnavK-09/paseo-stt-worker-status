@@ -23,8 +23,6 @@ function stateColor(key: EngineState["key"]): string {
   switch (key) {
     case "warm":
       return "#2fbf71";
-    case "cooling":
-      return "#e0a030";
     case "busy":
       return "#7b6cff";
     case "cold":
