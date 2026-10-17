@@ -1,8 +1,8 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
-export const dictationStatus = defineRpc({
-  name: "dictation.status",
+export const sttStatus = defineRpc({
+  name: "stt.status",
   input: z.object({}).strict(),
   output: z.object({
     daemon: z.boolean(),
@@ -16,8 +16,8 @@ export const dictationStatus = defineRpc({
         sizeMB: z.number().nullable(),
       }),
     ),
-    lastDictationStartedSecAgo: z.number().nullable(),
-    lastDictationProcessingMs: z.number().nullable(),
+    lastSttStartedSecAgo: z.number().nullable(),
+    lastSttProcessingMs: z.number().nullable(),
     lastFinalSecAgo: z.number().nullable(),
     lastWorkerSpawnSecAgo: z.number().nullable(),
     busy: z.boolean(),
@@ -26,4 +26,4 @@ export const dictationStatus = defineRpc({
   }),
 });
 
-export type DictationStatus = z.infer<typeof dictationStatus.output>;
+export type SttStatus = z.infer<typeof sttStatus.output>;

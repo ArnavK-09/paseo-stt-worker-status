@@ -1,8 +1,8 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { getDictationStatus } from "./server/dictation";
-import { dictationStatus } from "./shared/dictation";
+import { getSttStatus } from "./server/stt";
+import { sttStatus } from "./shared/stt";
 
 export default function contribute(server: PluginServerContext) {
-  server.handle(dictationStatus, getDictationStatus);
+  server.handle(sttStatus, getSttStatus);
   return () => {};
 }

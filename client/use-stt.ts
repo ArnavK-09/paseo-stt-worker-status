@@ -1,13 +1,13 @@
 import { useRpc } from "@getpaseo/plugin/client";
 import { useQuery } from "@tanstack/react-query";
-import { dictationStatus, type DictationStatus } from "../shared/dictation";
+import { sttStatus, type SttStatus } from "../shared/stt";
 
-export type Poll = ReturnType<typeof useDictationPoll>;
+export type Poll = ReturnType<typeof useSttPoll>;
 
-export function useDictationPoll(fast: boolean) {
-  const call = useRpc(dictationStatus);
+export function useSttPoll(fast: boolean) {
+  const call = useRpc(sttStatus);
   return useQuery({
-    queryKey: ["dictation-status", fast],
+    queryKey: ["stt-status", fast],
     queryFn: () => call({}),
     refetchInterval: fast ? 1500 : 3000,
     refetchIntervalInBackground: false,
@@ -22,9 +22,17 @@ export type EngineState = {
   detail: string;
 };
 
-export function engineState(data: DictationStatus | undefined, isLoading: boolean, isError: boolean): EngineState {
+export function engineState(
+  data: SttStatus | undefined,
+  isLoading: boolean,
+  isError: boolean,
+): EngineState {
   if (isError) {
-    return { key: "error", label: "unreachable", detail: "The daemon did not answer the status request." };
+    return {
+      key: "error",
+      label: "unreachable",
+      detail: "The daemon did not answer the status request.",
+    };
   }
   if (data === undefined) {
     return {
@@ -44,7 +52,11 @@ export function engineState(data: DictationStatus | undefined, isLoading: boolea
     };
   }
   if (data.warm) {
-    return { key: "warm", label: "warm", detail: "Speech worker (Paseo Voice) is running — dictation starts instantly." };
+    return {
+      key: "warm",
+      label: "warm",
+      detail: "Speech worker (Paseo Voice) is running — your voice reaches the model instantly.",
+    };
   }
   const justUsed = data.lastFinalSecAgo !== null && data.lastFinalSecAgo < 120;
   if (justUsed) {
@@ -54,14 +66,13 @@ export function engineState(data: DictationStatus | undefined, isLoading: boolea
       detail: `A transcript finished ${data.lastFinalSecAgo}s ago; Paseo releases the model shortly after each burst.`,
     };
   }
-  const slowLoad = data.lastDictationProcessingMs !== null && data.lastDictationProcessingMs > 3000;
+  const slowLoad = data.lastSttProcessingMs !== null && data.lastSttProcessingMs > 3000;
   return {
     key: "cold",
     label: "cold",
     detail:
-      (slowLoad
-        ? `Last cold start took ${(data.lastDictationProcessingMs ?? 0) / 1000}s. `
-        : "") + "Speak a throwaway word to pre-load before dictating.",
+      (slowLoad ? `Last cold start took ${(data.lastSttProcessingMs ?? 0) / 1000}s. ` : "") +
+      "Speak a throwaway word to warm up.",
   };
 }
 

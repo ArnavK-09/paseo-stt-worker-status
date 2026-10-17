@@ -3,35 +3,63 @@ import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { RpcInput } from "@getpaseo/plugin";
-import { dictationStatus, type DictationStatus } from "../shared/dictation";
+import { sttStatus, type SttStatus } from "../shared/stt";
 
 const PASEO_HOME = process.env.PASEO_HOME ?? path.join(homedir(), ".paseo");
 const MODELS_DIR = path.join(PASEO_HOME, "models", "local-speech");
 const LOG_PATH = path.join(PASEO_HOME, "daemon.log");
 
-/**
- * "Transcribing" detector: Linux accounting ticks of the Paseo Voice process.
- * At idle the worker burns exactly 0 ticks (verified live), while decoding a
- * Parakeet utterance spikes hard — so even 5 ticks (>50ms) since the previous
- * status poll means real work just happened or is happening right now.
- */
-type CpuSample = { pid: number; ticks: number; atMs: number };
+type CpuSample = { pid: number; ticks: number };
 let lastCpuSample: CpuSample | null = null;
 
-/** CLK_TCK is 100 on every modern Linux baseline; 1 tick = 10ms. */
 const MS_PER_TICK = 10;
-/** Any real decode easily tops 100ms of CPU; 5 ticks keeps false positives at zero. */
 const BUSY_TICKS = 5;
 
 const MODELS: ReadonlyArray<{ id: string; role: string }> = [
-  { id: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8", role: "dictation / voice STT (english-only)" },
+  {
+    id: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+    role: "STT for dictation and voice mode (english-only)",
+  },
   { id: "kokoro-en-v0_19", role: "voice TTS" },
   { id: "silero-vad", role: "voice turn detection" },
 ];
 
-type ModelProbe = DictationStatus["models"][number];
+type ModelProbe = SttStatus["models"][number];
 
-/** Warm = the "Paseo Voice" speech worker process is alive. */
+type SttTimeline = Pick<
+  SttStatus,
+  "lastWorkerSpawnSecAgo" | "lastSttStartedSecAgo" | "lastSttProcessingMs" | "lastFinalSecAgo"
+>;
+
+type LogLine = {
+  time?: number;
+  msg?: string;
+  latency?: Array<{ type?: string; maxMs?: number }>;
+  outboundSessionMessageTypesTop?: Array<[string, number]>;
+};
+
+function toSttStatus(
+  base: { daemon: boolean; warm: boolean; warmPid: number | null },
+  models: ModelProbe[],
+  timeline: SttTimeline,
+  cpu: { busy: boolean; deltaMs: number | null },
+  error: string | null,
+): SttStatus {
+  return {
+    daemon: base.daemon,
+    warm: base.warm,
+    warmPid: base.warmPid,
+    models,
+    lastSttStartedSecAgo: timeline.lastSttStartedSecAgo,
+    lastSttProcessingMs: timeline.lastSttProcessingMs,
+    lastFinalSecAgo: timeline.lastFinalSecAgo,
+    lastWorkerSpawnSecAgo: timeline.lastWorkerSpawnSecAgo,
+    busy: cpu.busy,
+    sttCpuDeltaMs: cpu.deltaMs,
+    error,
+  };
+}
+
 async function findWarmPid(): Promise<number | null> {
   let pids: string[];
   try {
@@ -40,8 +68,6 @@ async function findWarmPid(): Promise<number | null> {
     return null;
   }
 
-  // The speech worker's comm is "Paseo Voice". /proc/<pid>/comm is the cheapest
-  // source; test comm exactly, then fall back to a cmdline substring check.
   const hits = await Promise.all(
     pids.map(async (pid): Promise<number | null> => {
       try {
@@ -49,7 +75,10 @@ async function findWarmPid(): Promise<number | null> {
         if (comm === "paseo voice") {
           return Number(pid);
         }
-        const cmdline = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0").join(" ").toLowerCase();
+        const cmdline = (await readFile(`/proc/${pid}/cmdline`, "utf8"))
+          .split("\0")
+          .join(" ")
+          .toLowerCase();
         return cmdline.includes("paseo voice") ? Number(pid) : null;
       } catch {
         return null;
@@ -59,7 +88,6 @@ async function findWarmPid(): Promise<number | null> {
   return hits.find((pid): pid is number => pid !== null) ?? null;
 }
 
-/** Present = directory exists and contains at least one real file (not a stub). */
 async function probeModels(): Promise<ModelProbe[]> {
   return Promise.all(
     MODELS.map(async (m): Promise<ModelProbe> => {
@@ -86,12 +114,10 @@ async function dirSizeMB(dir: string): Promise<number | null> {
       entries.map(async (e) => {
         const full = path.join(d, e.name);
         if (e.isFile()) {
-          try {
-            const s = await stat(full);
+          const s = await stat(full).catch(() => null);
+          if (s !== null) {
             total += s.size;
             counted = true;
-          } catch {
-            // vanished while summing; ignore
           }
         } else if (e.isDirectory() && depth < 3) {
           await walk(full, depth + 1);
@@ -103,24 +129,11 @@ async function dirSizeMB(dir: string): Promise<number | null> {
     await walk(dir, 0);
     return counted ? Math.round((total / (1024 * 1024)) * 10) / 10 : null;
   } catch {
-    return null;
+    return counted && total > 0 ? Math.round((total / (1024 * 1024)) * 10) / 10 : null;
   }
 }
 
-type Timeline = Pick<
-  DictationStatus,
-  "lastWorkerSpawnSecAgo" | "lastDictationStartedSecAgo" | "lastDictationProcessingMs" | "lastFinalSecAgo"
->;
-
-type LogLine = {
-  time?: number;
-  msg?: string;
-  latency?: Array<{ type?: string; maxMs?: number }>;
-  outboundSessionMessageTypesTop?: Array<[string, number]>;
-};
-
-/** Parse the daemon log tail for the last dictation lifecycle events. */
-async function readLogTimeline(now: number): Promise<Timeline> {
+async function readLogTimeline(now: number): Promise<SttTimeline> {
   let fh: FileHandle | null = null;
   try {
     const s = await stat(LOG_PATH);
@@ -143,12 +156,18 @@ async function readLogTimeline(now: number): Promise<Timeline> {
         continue;
       }
       const msg = j.msg ?? "";
-      if (msg === "Local speech worker spawned" && lastSpawn === null && typeof j.time === "number") {
+      if (
+        msg === "Local speech worker spawned" &&
+        lastSpawn === null &&
+        typeof j.time === "number"
+      ) {
         lastSpawn = j.time;
       }
       if (msg === "ws_runtime_metrics") {
         if (lastFinal === null && typeof j.time === "number") {
-          const hasFinal = (j.outboundSessionMessageTypesTop ?? []).some(([t]) => t === "dictation_stream_final");
+          const hasFinal = (j.outboundSessionMessageTypesTop ?? []).some(
+            ([t]) => t === "dictation_stream_final",
+          );
           if (hasFinal) {
             lastFinal = j.time;
           }
@@ -156,7 +175,7 @@ async function readLogTimeline(now: number): Promise<Timeline> {
         if (lastStart === null && typeof j.time === "number") {
           for (const e of j.latency ?? []) {
             if (e.type === "dictation_stream_start" && typeof e.maxMs === "number") {
-              lastStart = { at: j.time as number, ms: e.maxMs };
+              lastStart = { at: j.time, ms: e.maxMs };
             }
           }
         }
@@ -171,96 +190,101 @@ async function readLogTimeline(now: number): Promise<Timeline> {
 
     return {
       lastWorkerSpawnSecAgo: sec(lastSpawn),
-      lastDictationStartedSecAgo: sec(lastStart?.at ?? null),
-      lastDictationProcessingMs: lastStart?.ms ?? null,
+      lastSttStartedSecAgo: sec(lastStart?.at ?? null),
+      lastSttProcessingMs: lastStart?.ms ?? null,
       lastFinalSecAgo: sec(lastFinal),
     };
   } catch {
     return {
       lastWorkerSpawnSecAgo: null,
-      lastDictationStartedSecAgo: null,
-      lastDictationProcessingMs: null,
+      lastSttStartedSecAgo: null,
+      lastSttProcessingMs: null,
       lastFinalSecAgo: null,
     };
   } finally {
-    await fh?.close().catch(() => undefined);
+    if (fh) {
+      await fh.close().catch(() => undefined);
+    }
   }
 }
 
-/** Reads utime+stime (fields 14/15) of /proc/<pid>/stat. */
 async function workerCpuTicks(pid: number): Promise<number | null> {
   try {
-    const parts = (await readFile(`/proc/${pid}/stat`, "utf8")).split(" ");
-    return Number(parts[13]) + Number(parts[14]);
+    const raw = (await readFile(`/proc/${pid}/stat`, "utf8")).trimEnd();
+    const closeIdx = raw.lastIndexOf(")");
+    if (closeIdx === -1) {
+      return null;
+    }
+    const fields = raw.slice(closeIdx + 2).split(" ");
+    const utime = Number(fields[11]);
+    const stime = Number(fields[12]);
+    if (!Number.isFinite(utime) || !Number.isFinite(stime)) {
+      return null;
+    }
+    return utime + stime;
   } catch {
     return null;
   }
 }
 
-/**
- * Returns the CPU burned by the speech worker since the previous status call
- * (same pid only), and updates the stored sample. Always samples when the
- * worker exists, so short spikes between polls are still caught.
- */
 async function sampleWorkerCpu(
   warmPid: number | null,
-  now: number,
-): Promise<{ busyStt: boolean; deltaMs: number | null }> {
+): Promise<{ busy: boolean; deltaMs: number | null }> {
   if (warmPid === null) {
     lastCpuSample = null;
-    return { busyStt: false, deltaMs: null };
+    return { busy: false, deltaMs: null };
   }
   const ticks = await workerCpuTicks(warmPid);
   if (ticks === null) {
     lastCpuSample = null;
-    return { busyStt: false, deltaMs: null };
+    return { busy: false, deltaMs: null };
   }
   const prev = lastCpuSample !== null && lastCpuSample.pid === warmPid ? lastCpuSample : null;
-  lastCpuSample = { pid: warmPid, ticks, atMs: now };
+  lastCpuSample = { pid: warmPid, ticks };
 
   if (prev === null) {
-    return { busyStt: false, deltaMs: null };
+    return { busy: false, deltaMs: null };
   }
   const deltaTicks = ticks - prev.ticks;
   return {
-    busyStt: deltaTicks >= BUSY_TICKS,
-    deltaMs: deltaTicks * MS_PER_TICK,
+    busy: deltaTicks >= BUSY_TICKS,
+    deltaMs: Math.max(0, deltaTicks) * MS_PER_TICK,
   };
 }
 
-export async function getDictationStatus(_input: RpcInput<typeof dictationStatus>): Promise<DictationStatus> {
+function emptyTimeline(): SttTimeline {
+  return {
+    lastWorkerSpawnSecAgo: null,
+    lastSttStartedSecAgo: null,
+    lastSttProcessingMs: null,
+    lastFinalSecAgo: null,
+  };
+}
+
+export async function getSttStatus(_input: RpcInput<typeof sttStatus>): Promise<SttStatus> {
+  const now = Date.now();
   try {
-    const now = Date.now();
     const warmPid = await findWarmPid();
     const [models, timeline, cpu] = await Promise.all([
       probeModels(),
       readLogTimeline(now),
-      sampleWorkerCpu(warmPid, now),
+      sampleWorkerCpu(warmPid),
     ]);
-    return {
-      daemon: true,
-      warm: warmPid !== null,
-      warmPid,
+    return toSttStatus(
+      { daemon: true, warm: warmPid !== null, warmPid },
       models,
-      ...timeline,
-      busy: cpu.busyStt,
-      sttCpuDeltaMs: cpu.deltaMs,
-      error: null,
-    };
+      timeline,
+      cpu,
+      null,
+    );
   } catch (e) {
     lastCpuSample = null;
-    return {
-      daemon: true,
-      warm: false,
-      warmPid: null,
-      models: [],
-      lastWorkerSpawnSecAgo: null,
-      lastDictationStartedSecAgo: null,
-      lastDictationProcessingMs: null,
-      lastFinalSecAgo: null,
-      busy: false,
-      sttCpuDeltaMs: null,
-      error: e instanceof Error ? e.message : String(e),
-    };
+    return toSttStatus(
+      { daemon: true, warm: false, warmPid: null },
+      [],
+      emptyTimeline(),
+      { busy: false, deltaMs: null },
+      e instanceof Error ? e.message : String(e),
+    );
   }
 }
