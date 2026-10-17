@@ -1,5 +1,4 @@
 <h1 align="center">🎤 paseo-stt-worker-status 🎤</h1>
-<h2 align="center">A live status light for Paseo's local STT worker — warm, cold, transcribing</h2>
 
 <p align="center">
     <img alt="hero" width="450" src="https://emoji-route.vercel.app/svg/🎤" />
@@ -28,9 +27,6 @@
 ```bash
 paseo plugin install github:ArnavK-09/paseo-stt-worker-status
 ```
-
-> Paseo clones the repository, prepares it, and compiles it on your daemon host — no package manager or dependency install is needed by the consumer.
-
 > [!IMPORTANT]
 > Requires [Paseo](https://paseo.sh) desktop `0.11.4+` on **Linux or macOS** (Paseo's platforms). Live worker probing is kernel-accurate on Linux (`/proc`) and uses `pgrep`/`ps` on macOS.
 
@@ -44,15 +40,17 @@ bun run typecheck
 paseo plugin add ./
 ```
 
-> Development tooling uses [bun](https://bun.sh) — `bun install` restores dependencies, `bun run typecheck`, `bun run lint`, and `bun run format` keep the codebase checked. Consumers of the published plugin never install dependencies: Paseo compiles it on the daemon host.
-
 ## 📷 Screenshots
 
 > Here are the screenshots of **paseo-stt-worker-status** in action
 
-| Sidebar footer status                         | Full detail screen                            |
-| --------------------------------------------- | --------------------------------------------- |
-| ![Footer status](docs/screenshots/footer.png) | ![Detail screen](docs/screenshots/detail.png) |
+| Sidebar footer status |
+|:------------------------:|
+| ![Footer status](https://github.com/user-attachments/assets/dd252772-a505-41d4-bdf7-9b2730793400) |
+
+| Full detail screen |
+|:---------------------:|
+| ![Detail screen](https://github.com/user-attachments/assets/6bd383e0-829d-4f9e-b3ef-ea3024220f9b) |
 
 ---
 
@@ -111,15 +109,6 @@ Found a bug or need help? Please create an issue on the [GitHub repository](http
 
 ---
 
-<h2 align="center">📄 License</h2>
-
-<p align="center">
-<strong>paseo-stt-worker-status</strong> is licensed under the <code>Unlicense</code> License. See the <a href="https://github.com/ArnavK-09/paseo-stt-worker-status/blob/main/LICENSE">LICENSE</a> file for more details.
-</p>
-
----
-
-<!-- <h3 align="center">💖 Thanks for Using paseo-stt-worker-status 💖</h3> -->
 
 <p align="center">
     <strong>🌟 If you find this project helpful, please give it a star on GitHub! 🌟</strong>
