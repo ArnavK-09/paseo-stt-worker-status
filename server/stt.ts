@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { open, readdir, readFile, stat } from "node:fs/promises";
+import { watch, type FSWatcher } from "node:fs";
+import { readdir, readFile, stat, open } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import path from "node:path";
@@ -15,11 +16,40 @@ const LOG_PATH = path.join(PASEO_HOME, "daemon.log");
 
 const OS = platform();
 const PROBE_TIMEOUT_MS = 2000;
+const WATCHER_RETRY_MS = 30000;
+const LOG_TAIL_BYTES = 512 * 1024;
+const LOG_DELTA_RESEED_BYTES = 2 * LOG_TAIL_BYTES;
+const COLD_SCAN_TTL_MS = 5000;
+const MODELS_TTL_MS = 60000;
+const TIMELINE_SCAN_MAX_LINES = 4000;
 
 type CpuSample = { pid: number; cpuMs: number };
 let lastCpuSample: CpuSample | null = null;
 
 const BUSY_DELTA_MS = 50;
+
+type WarmCache = { pid: number | null; fullScanAt: number };
+let warmCache: WarmCache | null = null;
+
+type TimelineSnapshot = {
+  spawnAt: number | null;
+  startAt: number | null;
+  startMs: number | null;
+  finalAt: number | null;
+};
+
+type TimelineCache = TimelineSnapshot & { size: number; aligned: boolean };
+let timelineCache: TimelineCache = {
+  spawnAt: null,
+  startAt: null,
+  startMs: null,
+  finalAt: null,
+  size: 0,
+  aligned: true,
+};
+
+type ModelProbe = SttStatus["models"][number];
+let modelsCache: { probes: ModelProbe[]; checkedAt: number } | null = null;
 
 const MODELS: ReadonlyArray<{ id: string; role: string }> = [
   {
@@ -29,8 +59,6 @@ const MODELS: ReadonlyArray<{ id: string; role: string }> = [
   { id: "kokoro-en-v0_19", role: "voice TTS" },
   { id: "silero-vad", role: "voice turn detection" },
 ];
-
-type ModelProbe = SttStatus["models"][number];
 
 type SttTimeline = Pick<
   SttStatus,
@@ -66,14 +94,240 @@ function toSttStatus(
   };
 }
 
-async function findWarmPid(): Promise<number | null> {
-  if (OS === "linux") {
-    return findWarmPidLinux();
+function timelineToState(t: TimelineSnapshot, now: number): SttTimeline {
+  const sec = (ts: number | null): number | null =>
+    ts === null ? null : Math.max(0, Math.round((now - ts) / 1000));
+  return {
+    lastWorkerSpawnSecAgo: sec(t.spawnAt),
+    lastSttStartedSecAgo: sec(t.startAt),
+    lastSttProcessingMs: (t.startAt !== null ? t.startMs : null) ?? null,
+    lastFinalSecAgo: sec(t.finalAt),
+  };
+}
+
+function emptyTimeline(): SttTimeline {
+  return {
+    lastWorkerSpawnSecAgo: null,
+    lastSttStartedSecAgo: null,
+    lastSttProcessingMs: null,
+    lastFinalSecAgo: null,
+  };
+}
+
+function absorbLogLine(line: string): void {
+  if (
+    line.indexOf("ws_runtime_metrics") === -1 &&
+    line.indexOf("Local speech worker spawned") === -1
+  ) {
+    return;
   }
-  if (OS === "darwin") {
-    return findWarmPidDarwin();
+  let j: LogLine;
+  try {
+    j = JSON.parse(line) as LogLine;
+  } catch {
+    return;
   }
-  return null;
+  const t = j.time;
+  if (typeof t !== "number") {
+    return;
+  }
+  const msg = j.msg ?? "";
+  if (msg === "Local speech worker spawned") {
+    if (timelineCache.spawnAt === null || t >= timelineCache.spawnAt) {
+      timelineCache.spawnAt = t;
+    }
+  }
+  if (msg !== "ws_runtime_metrics") {
+    return;
+  }
+  for (const e of j.latency ?? []) {
+    if (e.type === "dictation_stream_start" && typeof e.maxMs === "number") {
+      if (timelineCache.startAt === null || t >= timelineCache.startAt) {
+        timelineCache.startAt = t;
+        timelineCache.startMs = e.maxMs;
+      }
+    }
+  }
+  const hasFinal = (j.outboundSessionMessageTypesTop ?? []).some(
+    ([type]) => type === "dictation_stream_final",
+  );
+  if (hasFinal) {
+    if (timelineCache.finalAt === null || t >= timelineCache.finalAt) {
+      timelineCache.finalAt = t;
+    }
+  }
+}
+
+function scanLines(lines: string[]): void {
+  const scanCount = Math.min(lines.length, TIMELINE_SCAN_MAX_LINES);
+  for (let i = lines.length - scanCount; i < lines.length; i++) {
+    absorbLogLine(lines[i]);
+  }
+}
+
+async function readLogChunk(from: number, to: number): Promise<string> {
+  const fh: FileHandle = await open(LOG_PATH, "r");
+  try {
+    const buf = Buffer.alloc(to - from);
+    await fh.read(buf, 0, buf.length, from);
+    return buf.toString("utf8");
+  } finally {
+    await fh.close().catch(() => undefined);
+  }
+}
+
+async function refreshTimeline(): Promise<void> {
+  let size: number;
+  try {
+    size = (await stat(LOG_PATH)).size;
+  } catch {
+    timelineCache = {
+      spawnAt: null,
+      startAt: null,
+      startMs: null,
+      finalAt: null,
+      size: 0,
+      aligned: true,
+    };
+    return;
+  }
+  if (size === timelineCache.size) {
+    return;
+  }
+  try {
+    const isReseed =
+      timelineCache.size === 0 ||
+      size < timelineCache.size ||
+      size - timelineCache.size > LOG_DELTA_RESEED_BYTES;
+    const from = isReseed ? Math.max(0, size - LOG_TAIL_BYTES) : timelineCache.size;
+    const raw = await readLogChunk(from, size);
+
+    if (isReseed) {
+      timelineCache = {
+        spawnAt: null,
+        startAt: null,
+        startMs: null,
+        finalAt: null,
+        size,
+        aligned: false,
+      };
+    }
+
+    let skip = 0;
+    if (!timelineCache.aligned) {
+      const firstNl = raw.indexOf("\n");
+      if (firstNl === -1) {
+        return;
+      }
+      skip = firstNl + 1;
+      timelineCache.aligned = true;
+    }
+    const rest = raw.slice(skip);
+    const lastNl = rest.lastIndexOf("\n");
+    if (lastNl === -1) {
+      return;
+    }
+    scanLines(rest.slice(0, lastNl).split("\n"));
+    timelineCache.size = from + skip + lastNl + 1;
+  } catch {
+    timelineCache = {
+      spawnAt: null,
+      startAt: null,
+      startMs: null,
+      finalAt: null,
+      size: 0,
+      aligned: true,
+    };
+  }
+}
+
+function timelineSnapshot(): TimelineSnapshot {
+  return {
+    spawnAt: timelineCache.spawnAt,
+    startAt: timelineCache.startAt,
+    startMs: timelineCache.startMs,
+    finalAt: timelineCache.finalAt,
+  };
+}
+
+let logWatcher: FSWatcher | null = null;
+let logWatchInode: number | null = null;
+let watcherDeadAt: number | null = null;
+let refreshChain: Promise<void> = Promise.resolve();
+
+function refreshSerialized(): Promise<void> {
+  refreshChain = refreshChain.then(refreshTimeline).catch(() => undefined);
+  return refreshChain;
+}
+
+function detachLogWatcher(): void {
+  if (logWatcher !== null) {
+    logWatcher.close();
+    logWatcher = null;
+  }
+  logWatchInode = null;
+}
+
+function attachLogWatcher(): void {
+  if (logWatcher !== null) {
+    return;
+  }
+  try {
+    const w = watch(LOG_PATH, { persistent: false }, (eventType: "rename" | "change") => {
+      void refreshSerialized();
+      if (eventType === "rename") {
+        void stat(LOG_PATH)
+          .then((s) => {
+            if (logWatcher !== null && logWatchInode !== null && s.ino !== logWatchInode) {
+              detachLogWatcher();
+              attachLogWatcher();
+            }
+          })
+          .catch(() => undefined);
+      }
+    });
+    w.on("error", () => {
+      detachLogWatcher();
+      watcherDeadAt = Date.now();
+    });
+    w.unref();
+    logWatcher = w;
+    void stat(LOG_PATH)
+      .then((s) => {
+        logWatchInode = s.ino;
+      })
+      .catch(() => undefined);
+  } catch {
+    watcherDeadAt = Date.now();
+  }
+}
+
+function ensureLogWatcher(now: number): void {
+  if (logWatcher !== null) {
+    return;
+  }
+  if (watcherDeadAt !== null && now - watcherDeadAt < WATCHER_RETRY_MS) {
+    return;
+  }
+  attachLogWatcher();
+}
+
+export function startSttCacheWatcher(): () => void {
+  attachLogWatcher();
+  const watcher = logWatcher;
+  return () => {
+    if (logWatcher === watcher) {
+      detachLogWatcher();
+    }
+  };
+}
+
+async function readComm(pid: number): Promise<string | null> {
+  try {
+    return (await readFile(`/proc/${pid}/comm`, "utf8")).trim().toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
 async function findWarmPidLinux(): Promise<number | null> {
@@ -83,25 +337,22 @@ async function findWarmPidLinux(): Promise<number | null> {
   } catch {
     return null;
   }
-
-  const hits = await Promise.all(
-    pids.map(async (pid): Promise<number | null> => {
-      try {
-        const comm = (await readFile(`/proc/${pid}/comm`, "utf8")).trim().toLowerCase();
-        if (comm === "paseo voice") {
-          return Number(pid);
-        }
-        const cmdline = (await readFile(`/proc/${pid}/cmdline`, "utf8"))
-          .split("\0")
-          .join(" ")
-          .toLowerCase();
-        return cmdline.includes("paseo voice") ? Number(pid) : null;
-      } catch {
-        return null;
-      }
-    }),
+  const pidNumbers = pids.map(Number);
+  const comms = await Promise.all(pidNumbers.map((pid) => readComm(pid)));
+  const hit = comms.findIndex((comm) => comm === "paseo voice");
+  if (hit !== -1) {
+    return pidNumbers[hit];
+  }
+  const cmdlines = await Promise.all(
+    pidNumbers.map((pid) =>
+      readFile(`/proc/${pid}/cmdline`, "utf8")
+        .then((cmdline) =>
+          cmdline.split("\0").join(" ").toLowerCase().includes("paseo voice") ? pid : null,
+        )
+        .catch(() => null),
+    ),
   );
-  return hits.find((pid): pid is number => pid !== null) ?? null;
+  return cmdlines.find((pid): pid is number => pid !== null) ?? null;
 }
 
 async function findWarmPidDarwin(): Promise<number | null> {
@@ -134,6 +385,54 @@ async function darwinPidFromPs(): Promise<number | null> {
   } catch {
     return null;
   }
+}
+
+async function fullScanForWarmPid(): Promise<number | null> {
+  if (OS === "linux") {
+    return findWarmPidLinux();
+  }
+  if (OS === "darwin") {
+    return findWarmPidDarwin();
+  }
+  return null;
+}
+
+async function validateCachedPid(pid: number): Promise<boolean> {
+  if (OS === "linux") {
+    return (await readComm(pid)) === "paseo voice";
+  }
+  if (OS === "darwin") {
+    try {
+      const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "comm="], {
+        timeout: PROBE_TIMEOUT_MS,
+      });
+      return stdout.trim().toLowerCase().includes("paseo voice");
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function spawnSeenSince(at: number): boolean {
+  return timelineCache.spawnAt !== null && timelineCache.spawnAt > at;
+}
+
+async function findWarmPid(now: number): Promise<number | null> {
+  if (warmCache !== null) {
+    if (warmCache.pid !== null && (await validateCachedPid(warmCache.pid))) {
+      return warmCache.pid;
+    }
+    if (now - warmCache.fullScanAt < COLD_SCAN_TTL_MS && !spawnSeenSince(warmCache.fullScanAt)) {
+      if (warmCache.pid !== null) {
+        warmCache = { pid: null, fullScanAt: warmCache.fullScanAt };
+      }
+      return null;
+    }
+  }
+  const pid = await fullScanForWarmPid();
+  warmCache = { pid, fullScanAt: now };
+  return pid;
 }
 
 async function probeModels(): Promise<ModelProbe[]> {
@@ -181,79 +480,13 @@ async function dirSizeMB(dir: string): Promise<number | null> {
   }
 }
 
-async function readLogTimeline(now: number): Promise<SttTimeline> {
-  let fh: FileHandle | null = null;
-  try {
-    const s = await stat(LOG_PATH);
-    const len = Math.min(s.size, 512 * 1024);
-    fh = await open(LOG_PATH, "r");
-    const buf = Buffer.alloc(len);
-    await fh.read(buf, 0, len, s.size - len);
-    const lines = buf.toString("utf8").split("\n");
-    const scan = Math.min(lines.length, 4000);
-
-    let lastSpawn: number | null = null;
-    let lastStart: { at: number; ms: number } | null = null;
-    let lastFinal: number | null = null;
-
-    for (let i = lines.length - 1; i >= lines.length - scan && i >= 0; i--) {
-      let j: LogLine;
-      try {
-        j = JSON.parse(lines[i]) as LogLine;
-      } catch {
-        continue;
-      }
-      const msg = j.msg ?? "";
-      if (
-        msg === "Local speech worker spawned" &&
-        lastSpawn === null &&
-        typeof j.time === "number"
-      ) {
-        lastSpawn = j.time;
-      }
-      if (msg === "ws_runtime_metrics") {
-        if (lastFinal === null && typeof j.time === "number") {
-          const hasFinal = (j.outboundSessionMessageTypesTop ?? []).some(
-            ([t]) => t === "dictation_stream_final",
-          );
-          if (hasFinal) {
-            lastFinal = j.time;
-          }
-        }
-        if (lastStart === null && typeof j.time === "number") {
-          for (const e of j.latency ?? []) {
-            if (e.type === "dictation_stream_start" && typeof e.maxMs === "number") {
-              lastStart = { at: j.time, ms: e.maxMs };
-            }
-          }
-        }
-      }
-      if (lastSpawn !== null && lastStart !== null && lastFinal !== null) {
-        break;
-      }
-    }
-
-    const sec = (ts: number | null | undefined): number | null =>
-      typeof ts !== "number" ? null : Math.max(0, Math.round((now - ts) / 1000));
-
-    return {
-      lastWorkerSpawnSecAgo: sec(lastSpawn),
-      lastSttStartedSecAgo: sec(lastStart?.at ?? null),
-      lastSttProcessingMs: lastStart?.ms ?? null,
-      lastFinalSecAgo: sec(lastFinal),
-    };
-  } catch {
-    return {
-      lastWorkerSpawnSecAgo: null,
-      lastSttStartedSecAgo: null,
-      lastSttProcessingMs: null,
-      lastFinalSecAgo: null,
-    };
-  } finally {
-    if (fh) {
-      await fh.close().catch(() => undefined);
-    }
+async function probeModelsCached(now: number): Promise<ModelProbe[]> {
+  if (modelsCache !== null && now - modelsCache.checkedAt < MODELS_TTL_MS) {
+    return modelsCache.probes;
   }
+  const probes = await probeModels();
+  modelsCache = { probes, checkedAt: now };
+  return probes;
 }
 
 function parsePsCpuTimeMs(raw: string): number | null {
@@ -336,15 +569,6 @@ async function sampleWorkerCpu(
   };
 }
 
-function emptyTimeline(): SttTimeline {
-  return {
-    lastWorkerSpawnSecAgo: null,
-    lastSttStartedSecAgo: null,
-    lastSttProcessingMs: null,
-    lastFinalSecAgo: null,
-  };
-}
-
 export async function getSttStatus(_input: RpcInput<typeof sttStatus>): Promise<SttStatus> {
   const now = Date.now();
   if (OS !== "linux" && OS !== "darwin") {
@@ -356,13 +580,12 @@ export async function getSttStatus(_input: RpcInput<typeof sttStatus>): Promise<
       "Live worker probing supports Linux and macOS only; this host shows no warm/cold state.",
     );
   }
+  ensureLogWatcher(now);
   try {
-    const warmPid = await findWarmPid();
-    const [models, timeline, cpu] = await Promise.all([
-      probeModels(),
-      readLogTimeline(now),
-      sampleWorkerCpu(warmPid),
-    ]);
+    const [models] = await Promise.all([probeModelsCached(now), refreshSerialized()]);
+    const timeline = timelineToState(timelineSnapshot(), now);
+    const warmPid = await findWarmPid(now);
+    const cpu = await sampleWorkerCpu(warmPid);
     return toSttStatus(
       { daemon: true, warm: warmPid !== null, warmPid },
       models,
@@ -372,9 +595,10 @@ export async function getSttStatus(_input: RpcInput<typeof sttStatus>): Promise<
     );
   } catch (e) {
     lastCpuSample = null;
+    warmCache = null;
     return toSttStatus(
       { daemon: true, warm: false, warmPid: null },
-      [],
+      modelsCache?.probes ?? [],
       emptyTimeline(),
       { busy: false, deltaMs: null },
       e instanceof Error ? e.message : String(e),

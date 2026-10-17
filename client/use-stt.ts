@@ -9,7 +9,7 @@ export function useSttPoll(fast: boolean) {
   return useQuery({
     queryKey: ["stt-status", fast],
     queryFn: () => call({}),
-    refetchInterval: fast ? 1500 : 3000,
+    refetchInterval: fast ? 500 : 1000,
     refetchIntervalInBackground: false,
     retry: 1,
     staleTime: 1000,
@@ -58,7 +58,7 @@ export function engineState(
       detail: "Speech worker (Paseo Voice) is running — your voice reaches the model instantly.",
     };
   }
-  const justUsed = data.lastFinalSecAgo !== null && data.lastFinalSecAgo < 120;
+  const justUsed = data.lastFinalSecAgo !== null && data.lastFinalSecAgo < 60;
   if (justUsed) {
     return {
       key: "cooling",
