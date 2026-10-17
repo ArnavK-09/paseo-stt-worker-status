@@ -1,5 +1,6 @@
 {
   "id": "paseo-stt-worker-status",
+  "name": "STT Worker Status",
   "description": "Live sidebar status light for Paseo's local STT worker: warm vs cold, live transcribing activity, model inventory, and recent activity",
   "media": [],
   "requirements": {
