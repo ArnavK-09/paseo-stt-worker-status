@@ -1,0 +1,8 @@
+{
+  "id": "paseo-dictation-status",
+  "description": "Live sidebar status of Paseo's local dictation (Parakeet STT) engine: warm vs cold, model inventory, and recent activity",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.11.4"
+  }
+}
