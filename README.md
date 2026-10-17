@@ -13,8 +13,8 @@
 
 - **Live status dot** – green **warm**, amber **cooling**, gray **cold**, purple **transcribing** — straight in the sidebar footer
 - **Covers every voice surface** – the STT worker serves dictation _and_ voice mode; one letter for both
-- **Real process probing** – warm/cold state comes from the actual `Paseo Voice` process via `/proc`, never guessed
-- **Transcribe detection** – Linux CPU accounting ticks of the worker expose live Parakeet decoding activity
+- **Real process probing** – warm/cold state comes from the actual `Paseo Voice` process (procfs on Linux, `pgrep`/`ps` on macOS), never guessed
+- **Transcribe detection** – the worker's accumulated CPU time exposes live Parakeet decoding activity
 - **Model inventory** – see which local speech models are present and how big they are (Parakeet v2, Kokoro, Silero VAD)
 - **Recent activity timeline** – last worker spawn, last STT start, last finished transcript
 - **100% local** – no cloud calls, no accounts, no quota; reads your own host's procfs and daemon log only
@@ -32,7 +32,7 @@ paseo plugin install github:ArnavK-09/paseo-stt-worker-status
 > Paseo clones the repository, prepares it, and compiles it on your daemon host — no package manager or dependency install is needed by the consumer.
 
 > [!IMPORTANT]
-> Requires [Paseo](https://paseo.sh) desktop `0.11.4+`. Status probing is Linux-based (`/proc`); a worker running on Linux shows full accuracy right now.
+> Requires [Paseo](https://paseo.sh) desktop `0.11.4+` on **Linux or macOS** (Paseo's platforms). Live worker probing is kernel-accurate on Linux (`/proc`) and uses `pgrep`/`ps` on macOS.
 
 ###### From a local checkout (for development)
 
@@ -108,16 +108,6 @@ Found a bug or need help? Please create an issue on the [GitHub repository](http
     </tr>
   </tbody>
 </table>
-
-## 🛣️ Roadmap
-
-|                  Task                  | Status |
-| :------------------------------------: | :----: |
-|      🟢 Worker warm / cold states      |   🟢   |
-|     🟢 Live transcribing detection     |   🟢   |
-| 🟢 Model inventory + activity timeline |   🟢   |
-|            🟡 macOS support            |   🟡   |
-|           🔴 Windows support           |   🔴   |
 
 ---
 

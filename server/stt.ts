@@ -1,19 +1,25 @@
+import { execFile } from "node:child_process";
 import { open, readdir, readFile, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { RpcInput } from "@getpaseo/plugin";
 import { sttStatus, type SttStatus } from "../shared/stt";
+
+const execFileAsync = promisify(execFile);
 
 const PASEO_HOME = process.env.PASEO_HOME ?? path.join(homedir(), ".paseo");
 const MODELS_DIR = path.join(PASEO_HOME, "models", "local-speech");
 const LOG_PATH = path.join(PASEO_HOME, "daemon.log");
 
-type CpuSample = { pid: number; ticks: number };
+const OS = platform();
+const PROBE_TIMEOUT_MS = 2000;
+
+type CpuSample = { pid: number; cpuMs: number };
 let lastCpuSample: CpuSample | null = null;
 
-const MS_PER_TICK = 10;
-const BUSY_TICKS = 5;
+const BUSY_DELTA_MS = 50;
 
 const MODELS: ReadonlyArray<{ id: string; role: string }> = [
   {
@@ -61,6 +67,16 @@ function toSttStatus(
 }
 
 async function findWarmPid(): Promise<number | null> {
+  if (OS === "linux") {
+    return findWarmPidLinux();
+  }
+  if (OS === "darwin") {
+    return findWarmPidDarwin();
+  }
+  return null;
+}
+
+async function findWarmPidLinux(): Promise<number | null> {
   let pids: string[];
   try {
     pids = (await readdir("/proc")).filter((e) => /^\d+$/.test(e));
@@ -86,6 +102,38 @@ async function findWarmPid(): Promise<number | null> {
     }),
   );
   return hits.find((pid): pid is number => pid !== null) ?? null;
+}
+
+async function findWarmPidDarwin(): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync("pgrep", ["-x", "Paseo Voice"], {
+      timeout: PROBE_TIMEOUT_MS,
+    });
+    const pid = Number(stdout.split("\n")[0]?.trim() ?? "");
+    if (Number.isFinite(pid) && pid > 0) {
+      return pid;
+    }
+    return null;
+  } catch {
+    return darwinPidFromPs();
+  }
+}
+
+async function darwinPidFromPs(): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,comm="], {
+      timeout: PROBE_TIMEOUT_MS,
+    });
+    for (const line of stdout.split("\n")) {
+      const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (match && match[2].toLowerCase().includes("paseo voice")) {
+        return Number(match[1]);
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 async function probeModels(): Promise<ModelProbe[]> {
@@ -208,23 +256,59 @@ async function readLogTimeline(now: number): Promise<SttTimeline> {
   }
 }
 
-async function workerCpuTicks(pid: number): Promise<number | null> {
-  try {
-    const raw = (await readFile(`/proc/${pid}/stat`, "utf8")).trimEnd();
-    const closeIdx = raw.lastIndexOf(")");
-    if (closeIdx === -1) {
-      return null;
-    }
-    const fields = raw.slice(closeIdx + 2).split(" ");
-    const utime = Number(fields[11]);
-    const stime = Number(fields[12]);
-    if (!Number.isFinite(utime) || !Number.isFinite(stime)) {
-      return null;
-    }
-    return utime + stime;
-  } catch {
+function parsePsCpuTimeMs(raw: string): number | null {
+  const value = raw.trim();
+  const dashIdx = value.indexOf("-");
+  const clock = dashIdx !== -1 ? value.slice(dashIdx + 1) : value;
+  const parts = clock.split(":");
+  if (parts.length < 2) {
     return null;
   }
+  let seconds = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const segment = Number(parts[i]);
+    if (!Number.isFinite(segment) || segment < 0) {
+      return null;
+    }
+    if (i === parts.length - 1) {
+      seconds += segment;
+    } else {
+      seconds += segment * 60 ** (parts.length - 1 - i);
+    }
+  }
+  return Math.round(seconds * 1000);
+}
+
+async function workerCpuCumulativeMs(pid: number): Promise<number | null> {
+  if (OS === "linux") {
+    try {
+      const raw = (await readFile(`/proc/${pid}/stat`, "utf8")).trimEnd();
+      const closeIdx = raw.lastIndexOf(")");
+      if (closeIdx === -1) {
+        return null;
+      }
+      const fields = raw.slice(closeIdx + 2).split(" ");
+      const utime = Number(fields[11]);
+      const stime = Number(fields[12]);
+      if (!Number.isFinite(utime) || !Number.isFinite(stime)) {
+        return null;
+      }
+      return (utime + stime) * 10;
+    } catch {
+      return null;
+    }
+  }
+  if (OS === "darwin") {
+    try {
+      const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "time="], {
+        timeout: PROBE_TIMEOUT_MS,
+      });
+      return parsePsCpuTimeMs(stdout);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 async function sampleWorkerCpu(
@@ -234,21 +318,21 @@ async function sampleWorkerCpu(
     lastCpuSample = null;
     return { busy: false, deltaMs: null };
   }
-  const ticks = await workerCpuTicks(warmPid);
-  if (ticks === null) {
+  const cpuMs = await workerCpuCumulativeMs(warmPid);
+  if (cpuMs === null) {
     lastCpuSample = null;
     return { busy: false, deltaMs: null };
   }
   const prev = lastCpuSample !== null && lastCpuSample.pid === warmPid ? lastCpuSample : null;
-  lastCpuSample = { pid: warmPid, ticks };
+  lastCpuSample = { pid: warmPid, cpuMs };
 
   if (prev === null) {
     return { busy: false, deltaMs: null };
   }
-  const deltaTicks = ticks - prev.ticks;
+  const delta = Math.max(0, cpuMs - prev.cpuMs);
   return {
-    busy: deltaTicks >= BUSY_TICKS,
-    deltaMs: Math.max(0, deltaTicks) * MS_PER_TICK,
+    busy: delta >= BUSY_DELTA_MS,
+    deltaMs: delta,
   };
 }
 
@@ -263,6 +347,15 @@ function emptyTimeline(): SttTimeline {
 
 export async function getSttStatus(_input: RpcInput<typeof sttStatus>): Promise<SttStatus> {
   const now = Date.now();
+  if (OS !== "linux" && OS !== "darwin") {
+    return toSttStatus(
+      { daemon: true, warm: false, warmPid: null },
+      [],
+      emptyTimeline(),
+      { busy: false, deltaMs: null },
+      "Live worker probing supports Linux and macOS only; this host shows no warm/cold state.",
+    );
+  }
   try {
     const warmPid = await findWarmPid();
     const [models, timeline, cpu] = await Promise.all([
