@@ -3,14 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "license": "Unlicense",
-  "files": [
-    "paseo-plugin.json",
-    "index.client.tsx",
-    "index.server.ts",
-    "client/",
-    "server/",
-    "shared/"
-  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "oxlint .",

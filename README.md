@@ -29,7 +29,7 @@
 paseo plugin install github:ArnavK-09/paseo-stt-worker-status
 ```
 
-> Paseo clones the repository, prepares it, and compiles it on your daemon host — no `npm install` is needed by the consumer.
+> Paseo clones the repository, prepares it, and compiles it on your daemon host — no package manager or dependency install is needed by the consumer.
 
 > [!IMPORTANT]
 > Requires [Paseo](https://paseo.sh) desktop `0.11.4+`. Status probing is Linux-based (`/proc`); a worker running on Linux shows full accuracy right now.
@@ -39,10 +39,12 @@ paseo plugin install github:ArnavK-09/paseo-stt-worker-status
 ```bash
 git clone https://github.com/ArnavK-09/paseo-stt-worker-status.git
 cd paseo-stt-worker-status
-npm install
-npm run typecheck
+bun install
+bun run typecheck
 paseo plugin add ./
 ```
+
+> Development tooling uses [bun](https://bun.sh) — `bun install` restores dependencies, `bun run typecheck`, `bun run lint`, and `bun run format` keep the codebase checked. Consumers of the published plugin never install dependencies: Paseo compiles it on the daemon host.
 
 ## 📷 Screenshots
 
